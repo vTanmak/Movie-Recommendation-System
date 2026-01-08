@@ -1,0 +1,16 @@
+# Ignore large data files and cached items
+Data/
+cache/
+*.csv
+*.pkl
+
+# Ignore Secrets and configurations
+.streamlit/secrets.toml
+.env
+venv/
+env/
+
+# Ignore Python caches
+__pycache__/
+*.py[cod]
+*$py.class
