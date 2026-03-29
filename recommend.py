@@ -1,11 +1,14 @@
 import difflib
+import pandas as pd
+import numpy as np
+from sklearn.metrics.pairwise import cosine_similarity
 from preprocess import load_cache, cache_exists, run_preprocessing
 
 if not cache_exists():
     print("Cache not found. Running preprocessing pipeline first...")
     run_preprocessing()
 
-cosine_sim, indices, movies_df = load_cache()
+tfidf_matrix, indices, movies_df = load_cache()
 
 def get_recommendations(title: str, n: int = 10) -> list[dict]:
     matched_title = None
@@ -22,7 +25,14 @@ def get_recommendations(title: str, n: int = 10) -> list[dict]:
         return []
 
     idx = indices[matched_title]
-    sim_scores = list(enumerate(cosine_sim[idx]))
+    if isinstance(idx, (pd.Series, np.ndarray)):
+        idx = idx.iloc[0] if hasattr(idx, 'iloc') else idx[0]
+    
+    # Compute similarity for this specific movie against all others on-the-fly
+
+    movie_vector = tfidf_matrix[idx]
+    sim_scores_array = cosine_similarity(movie_vector, tfidf_matrix).flatten()
+    sim_scores = list(enumerate(sim_scores_array))
 
     import math
     hybrid_scores = []

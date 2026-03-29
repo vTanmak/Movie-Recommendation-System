@@ -4,7 +4,7 @@ import joblib
 import numpy as np
 import pandas as pd
 from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import linear_kernel
+from sklearn.metrics.pairwise import cosine_similarity
 
 
 BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
@@ -46,25 +46,54 @@ def _clean_name(name: str) -> str:
 
 
 def _build_soup(row: pd.Series) -> str:
-    genres   = [_clean_name(g) for g in row["genres_list"]]
-    cast     = [_clean_name(c) for c in row["cast_list"]]
-    keywords = [_clean_name(k) for k in row["keywords_list"]]
-    director = _clean_name(row["director"]) if row["director"] else ""
+    genres   = [_clean_name(g) for g in row.get("genres_list", [])]
+    cast     = [_clean_name(c) for c in row.get("cast_list", [])]
+    keywords = [_clean_name(k) for k in row.get("keywords_list", [])]
+    director = _clean_name(row.get("director", "")) if row.get("director") else ""
 
     parts = genres + cast + keywords + [director, director] + [row["overview"]]
     return " ".join(filter(None, parts)).lower()
 
 
 def load_and_merge() -> pd.DataFrame:
-    movies  = pd.read_csv(MOVIES_CSV)
-    credits = pd.read_csv(CREDITS_CSV)
+    # Check if files exist with the common Kaggle names (prioritize the larger 45k metadata)
+    m_path = os.path.join(DATA_DIR, "movies_metadata.csv") if os.path.exists(os.path.join(DATA_DIR, "movies_metadata.csv")) else MOVIES_CSV
+    c_path = os.path.join(DATA_DIR, "credits.csv") if os.path.exists(os.path.join(DATA_DIR, "credits.csv")) else CREDITS_CSV
+    
+    if not os.path.exists(m_path):
+        raise FileNotFoundError(f"Missing movie dataset. Please ensure {m_path} exists in Data/ folder.")
 
-    movies  = movies.rename(columns={"id": "movie_id"})
-    df = movies.merge(credits, on="movie_id", how="inner")
 
-    if "title_x" in df.columns:
-        df = df.rename(columns={"title_x": "title"})
-        df = df.drop(columns=["title_y"], errors="ignore")
+    movies  = pd.read_csv(m_path, low_memory=False)
+    
+    # Standardize column names for the 45k dataset (which uses 'id' instead of 'movie_id')
+    if "id" in movies.columns and "movie_id" not in movies.columns:
+        movies = movies.rename(columns={"id": "movie_id"})
+    
+    # Some datasets have 'id' as a string with junk, clean it
+    movies["movie_id"] = pd.to_numeric(movies["movie_id"], errors="coerce")
+    movies = movies.dropna(subset=["movie_id"]).astype({"movie_id": int})
+
+    if os.path.exists(c_path):
+        credits = pd.read_csv(c_path)
+        # Handle 45k credits column name 'id'
+        if "id" in credits.columns and "movie_id" not in credits.columns:
+            credits = credits.rename(columns={"id": "movie_id"})
+        
+        credits["movie_id"] = pd.to_numeric(credits["movie_id"], errors="coerce")
+        credits = credits.dropna(subset=["movie_id"]).astype({"movie_id": int})
+        
+        df = movies.merge(credits, on="movie_id", how="inner")
+    else:
+        # Fallback if credits file isn't provided (some larger datasets combine them)
+        print(f"  Warning: {c_path} not found. Proceeding with movies only.")
+        df = movies
+
+    # Standardize Title column
+    for col in ["title", "original_title", "title_x"]:
+        if col in df.columns:
+            df = df.rename(columns={col: "title"})
+            break
 
     return df
 
@@ -73,10 +102,29 @@ def clean(df: pd.DataFrame) -> pd.DataFrame:
     df = df.dropna(subset=["title"])
     df["overview"] = df["overview"].fillna("")
 
-    df["genres_list"]   = df["genres"].apply(lambda x: _parse_names(x))
-    df["keywords_list"] = df["keywords"].apply(lambda x: _parse_names(x, max_items=5))
-    df["cast_list"]     = df["cast"].apply(lambda x: _parse_names(x, max_items=3))
-    df["director"]      = df["crew"].apply(_get_director)
+    # Clean popularity column (45k dataset has strings)
+    if "popularity" in df.columns:
+        df["popularity"] = pd.to_numeric(df["popularity"], errors="coerce").fillna(0)
+    
+    if "genres" in df.columns:
+        df["genres_list"] = df["genres"].apply(lambda x: _parse_names(x))
+    else:
+        df["genres_list"] = [[] for _ in range(len(df))]
+
+    if "keywords" in df.columns:
+        df["keywords_list"] = df["keywords"].apply(lambda x: _parse_names(x, max_items=5))
+    else:
+        df["keywords_list"] = [[] for _ in range(len(df))]
+
+    if "cast" in df.columns:
+        df["cast_list"] = df["cast"].apply(lambda x: _parse_names(x, max_items=3))
+    else:
+        df["cast_list"] = [[] for _ in range(len(df))]
+
+    if "crew" in df.columns:
+        df["director"] = df["crew"].apply(_get_director)
+    else:
+        df["director"] = ["" for _ in range(len(df))]
 
     df["year"] = pd.to_datetime(df["release_date"], errors="coerce").dt.year
 
@@ -91,31 +139,29 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
 def compute_similarity(df: pd.DataFrame):
     tfidf = TfidfVectorizer(stop_words="english", max_features=15_000)
     tfidf_matrix = tfidf.fit_transform(df["soup"])
-
-    print(f"  TF-IDF matrix shape: {tfidf_matrix.shape}")
-
-    cosine_sim = linear_kernel(tfidf_matrix, tfidf_matrix)
+    
+    print(f"  TF-IDF sparse matrix shape: {tfidf_matrix.shape}")
 
     df = df.reset_index(drop=True)
     indices = pd.Series(df.index, index=df["title"]).drop_duplicates()
 
-    return cosine_sim, indices, df
+    return tfidf_matrix, indices, df
 
 
-def save_cache(cosine_sim, indices, df: pd.DataFrame) -> None:
-    joblib.dump(cosine_sim, MATRIX_PATH)
+def save_cache(tfidf_matrix, indices, df: pd.DataFrame) -> None:
+    joblib.dump(tfidf_matrix, MATRIX_PATH)
     joblib.dump(indices,    INDEX_PATH)
     joblib.dump(df,         DF_PATH)
-    print(f"  Saved similarity matrix -> {MATRIX_PATH}")
-    print(f"  Saved title index       -> {INDEX_PATH}")
-    print(f"  Saved dataframe         -> {DF_PATH}")
+    print(f"  Saved sparse matrix  -> {MATRIX_PATH}")
+    print(f"  Saved title index    -> {INDEX_PATH}")
+    print(f"  Saved dataframe      -> {DF_PATH}")
 
 
 def load_cache():
-    cosine_sim = joblib.load(MATRIX_PATH)
+    tfidf_matrix = joblib.load(MATRIX_PATH)
     indices    = joblib.load(INDEX_PATH)
     df         = joblib.load(DF_PATH)
-    return cosine_sim, indices, df
+    return tfidf_matrix, indices, df
 
 
 def cache_exists() -> bool:
@@ -134,12 +180,11 @@ def run_preprocessing() -> None:
     print("Building feature soup…")
     df = build_features(df)
 
-    print("Computing TF-IDF and cosine similarity matrix…")
-    cosine_sim, indices, df = compute_similarity(df)
-    print(f"  Similarity matrix shape: {cosine_sim.shape}")
-
+    print("Computing TF-IDF sparse matrix…")
+    tfidf_matrix, indices, df = compute_similarity(df)
+    
     print("Saving cache…")
-    save_cache(cosine_sim, indices, df)
+    save_cache(tfidf_matrix, indices, df)
 
     print("\nDone! Preprocessing complete. Cache saved to ./cache/")
 

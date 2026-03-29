@@ -121,8 +121,6 @@ def safe_year(y) -> str:
     return "N/A"
 
 st.markdown('<p class="hero-title">Movie Recommendation System</p>', unsafe_allow_html=True)
-st.markdown('<p class="hero-sub">Discover movies you\'ll love — powered by content-based AI</p>',
-            unsafe_allow_html=True)
 st.markdown("---")
 
 with st.sidebar:
